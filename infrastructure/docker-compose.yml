@@ -1,0 +1,345 @@
+version: "3.9"
+
+# =============================================================
+# DevStacks — Lokális fejlesztői környezet
+# Használat: docker compose -f infrastructure/docker-compose.yml up -d
+# =============================================================
+
+x-laravel-common: &laravel-common
+  restart: unless-stopped
+  networks:
+    - devstacks
+  depends_on:
+    postgres:
+      condition: service_healthy
+    mongo:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    localstack:
+      condition: service_healthy
+
+services:
+
+  # -----------------------------------------------------------
+  # ADATBÁZISOK
+  # -----------------------------------------------------------
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: devstacks-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: devstacks
+      POSTGRES_USER: devstacks
+      POSTGRES_PASSWORD: secret
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - devstacks
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U devstacks -d devstacks"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  mongo:
+    image: mongo:7
+    container_name: devstacks-mongo
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_DATABASE: devstacks
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - devstacks
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: devstacks-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - devstacks
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # -----------------------------------------------------------
+  # LOCALSTACK — AWS SQS / S3 / EventBridge lokálisan
+  # -----------------------------------------------------------
+
+  localstack:
+    image: localstack/localstack:3
+    container_name: devstacks-localstack
+    restart: unless-stopped
+    environment:
+      SERVICES: sqs,s3,events
+      DEFAULT_REGION: eu-central-1
+      EAGER_SERVICE_LOADING: 1
+    ports:
+      - "4566:4566"
+    volumes:
+      - localstack_data:/var/lib/localstack
+      - ./localstack-init:/etc/localstack/init/ready.d
+    networks:
+      - devstacks
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # -----------------------------------------------------------
+  # PHP SERVICES
+  # -----------------------------------------------------------
+
+  api-gateway:
+    <<: *laravel-common
+    build:
+      context: ../services/api-gateway
+      dockerfile: Dockerfile
+      target: development
+    container_name: devstacks-api-gateway
+    ports:
+      - "8000:80"
+    volumes:
+      - ../services/api-gateway:/var/www/html
+      - /var/www/html/vendor  # vendor mappa ne legyen felülírva
+    environment:
+      APP_ENV: local
+      APP_DEBUG: "true"
+      APP_URL: http://localhost:8000
+      DB_CONNECTION: pgsql
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_DATABASE: devstacks
+      DB_USERNAME: devstacks
+      DB_PASSWORD: secret
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      MONGODB_URI: mongodb://mongo:27017/devstacks
+      AWS_DEFAULT_REGION: eu-central-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_ENDPOINT_URL: http://localstack:4566
+      QUEUE_CONNECTION: sqs
+      SQS_PREFIX: http://localstack:4566/000000000000
+
+  scraper-service:
+    <<: *laravel-common
+    build:
+      context: ../services/scraper-service
+      dockerfile: Dockerfile
+      target: development
+    container_name: devstacks-scraper
+    volumes:
+      - ../services/scraper-service:/var/www/html
+      - /var/www/html/vendor
+    environment:
+      APP_ENV: local
+      APP_DEBUG: "true"
+      MONGODB_URI: mongodb://mongo:27017/devstacks
+      AWS_DEFAULT_REGION: eu-central-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_ENDPOINT_URL: http://localstack:4566
+      QUEUE_CONNECTION: sqs
+      SQS_PREFIX: http://localstack:4566/000000000000
+      SQS_QUEUE_JOBS_SCRAPED: devstacks-jobs-scraped
+      REDIS_HOST: redis
+
+  analytics-service:
+    <<: *laravel-common
+    build:
+      context: ../services/analytics-service
+      dockerfile: Dockerfile
+      target: development
+    container_name: devstacks-analytics
+    volumes:
+      - ../services/analytics-service:/var/www/html
+      - /var/www/html/vendor
+    environment:
+      APP_ENV: local
+      APP_DEBUG: "true"
+      DB_CONNECTION: pgsql
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_DATABASE: devstacks
+      DB_USERNAME: devstacks
+      DB_PASSWORD: secret
+      REDIS_HOST: redis
+      AWS_DEFAULT_REGION: eu-central-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_ENDPOINT_URL: http://localstack:4566
+      SQS_PREFIX: http://localstack:4566/000000000000
+
+  alert-service:
+    <<: *laravel-common
+    build:
+      context: ../services/alert-service
+      dockerfile: Dockerfile
+      target: development
+    container_name: devstacks-alert
+    volumes:
+      - ../services/alert-service:/var/www/html
+      - /var/www/html/vendor
+    environment:
+      APP_ENV: local
+      APP_DEBUG: "true"
+      DB_CONNECTION: pgsql
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_DATABASE: devstacks
+      DB_USERNAME: devstacks
+      DB_PASSWORD: secret
+      REDIS_HOST: redis
+      MAIL_MAILER: log  # lokálisan logba írja az emaileket
+      AWS_DEFAULT_REGION: eu-central-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_ENDPOINT_URL: http://localstack:4566
+      SQS_PREFIX: http://localstack:4566/000000000000
+
+  # -----------------------------------------------------------
+  # PYTHON DATA PIPELINE
+  # -----------------------------------------------------------
+
+  data-pipeline:
+    build:
+      context: ../services/data-pipeline
+      dockerfile: Dockerfile
+    container_name: devstacks-pipeline
+    restart: unless-stopped
+    volumes:
+      - ../services/data-pipeline:/app
+    environment:
+      MONGODB_URI: mongodb://mongo:27017/devstacks
+      POSTGRES_URI: postgresql://devstacks:secret@postgres:5432/devstacks
+      AWS_DEFAULT_REGION: eu-central-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_ENDPOINT_URL: http://localstack:4566
+      SQS_QUEUE_JOBS_SCRAPED: http://localstack:4566/000000000000/devstacks-jobs-scraped
+      SQS_QUEUE_JOBS_PROCESSED: http://localstack:4566/000000000000/devstacks-jobs-processed
+      AIRFLOW_HOME: /app/airflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    networks:
+      - devstacks
+
+  # Airflow webserver — DAG monitoring UI
+  airflow-webserver:
+    build:
+      context: ../services/data-pipeline
+      dockerfile: Dockerfile
+    container_name: devstacks-airflow-web
+    restart: unless-stopped
+    command: airflow webserver
+    ports:
+      - "8080:8080"
+    volumes:
+      - ../services/data-pipeline:/app
+    environment:
+      MONGODB_URI: mongodb://mongo:27017/devstacks
+      POSTGRES_URI: postgresql://devstacks:secret@postgres:5432/devstacks
+      AIRFLOW_HOME: /app/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://devstacks:secret@postgres:5432/devstacks
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - devstacks
+
+  airflow-scheduler:
+    build:
+      context: ../services/data-pipeline
+      dockerfile: Dockerfile
+    container_name: devstacks-airflow-scheduler
+    restart: unless-stopped
+    command: airflow scheduler
+    volumes:
+      - ../services/data-pipeline:/app
+    environment:
+      MONGODB_URI: mongodb://mongo:27017/devstacks
+      POSTGRES_URI: postgresql://devstacks:secret@postgres:5432/devstacks
+      AIRFLOW_HOME: /app/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://devstacks:secret@postgres:5432/devstacks
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - devstacks
+
+  # -----------------------------------------------------------
+  # VUE 3 FRONTEND
+  # -----------------------------------------------------------
+
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+      target: development
+    container_name: devstacks-frontend
+    restart: unless-stopped
+    ports:
+      - "5173:5173"
+    volumes:
+      - ../frontend:/app
+      - /app/node_modules
+    environment:
+      VITE_API_BASE_URL: http://localhost:8000/api/v1
+    networks:
+      - devstacks
+
+  # -----------------------------------------------------------
+  # MAILPIT — email fogadás lokálisan (Alert Service teszteléshez)
+  # -----------------------------------------------------------
+
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: devstacks-mailpit
+    restart: unless-stopped
+    ports:
+      - "8025:8025"  # Web UI
+      - "1025:1025"  # SMTP
+    networks:
+      - devstacks
+
+# -----------------------------------------------------------
+# VOLUMES ÉS NETWORK
+# -----------------------------------------------------------
+
+volumes:
+  postgres_data:
+  mongo_data:
+  redis_data:
+  localstack_data:
+
+networks:
+  devstacks:
+    driver: bridge
