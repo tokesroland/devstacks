@@ -1,97 +1,44 @@
 # =============================================================
-# Laravel service Dockerfile
-# Használat: minden PHP Laravel service-hez (api-gateway, scraper, stb.)
-# Multi-stage: development (hot reload) és production (optimalizált)
+# Vue 3 frontend Dockerfile
+# Multi-stage: development (Vite dev server, hot reload) és
+# production (statikus build, Nginx-szel kiszolgálva)
 # =============================================================
 
 # -----------------------------------------------------------
-# BASE — közös PHP alap mindkét stage-hez
+# DEVELOPMENT — volume mount-tal, Vite dev server
 # -----------------------------------------------------------
-FROM php:8.3-fpm-alpine AS base
+FROM node:20-alpine AS development
 
-# System dependencies
-RUN apk add --no-cache \
-    postgresql-dev \
-    libzip-dev \
-    oniguruma-dev \
-    curl \
-    nginx \
-    supervisor
+WORKDIR /app
 
-# PHP extensions
-RUN docker-php-ext-install \
-    pdo \
-    pdo_pgsql \
-    pgsql \
-    zip \
-    mbstring \
-    pcntl \
-    bcmath
+COPY package*.json ./
+RUN npm install
 
-# MongoDB PHP extension (pecl-ből)
-RUN apk add --no-cache $PHPIZE_DEPS \
-    && pecl install mongodb \
-    && docker-php-ext-enable mongodb \
-    && apk del $PHPIZE_DEPS
+EXPOSE 5173
 
-# Redis PHP extension
-RUN apk add --no-cache $PHPIZE_DEPS \
-    && pecl install redis \
-    && docker-php-ext-enable redis \
-    && apk del $PHPIZE_DEPS
-
-# Composer
-COPY --from=composer:2.7 /usr/bin/composer /usr/bin/composer
-
-WORKDIR /var/www/html
+CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
 
 # -----------------------------------------------------------
-# DEVELOPMENT — volume mount-tal, nincs kód copy
+# BUILD — statikus assetek előállítása
 # -----------------------------------------------------------
-FROM base AS development
+FROM node:20-alpine AS build
 
-# PHP konfiguráció fejlesztőkhöz
-RUN cp "$PHP_INI_DIR/php.ini-development" "$PHP_INI_DIR/php.ini"
+WORKDIR /app
 
-# Nginx konfiguráció
-COPY docker/nginx.conf /etc/nginx/nginx.conf
+COPY package*.json ./
+RUN npm install
 
-# Supervisor: nginx + php-fpm egyszerre fut
-COPY docker/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
-
-EXPOSE 80
-
-CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
-
-# -----------------------------------------------------------
-# PRODUCTION — kód bemásolva, optimalizált
-# -----------------------------------------------------------
-FROM base AS production
-
-RUN cp "$PHP_INI_DIR/php.ini-production" "$PHP_INI_DIR/php.ini"
-
-# Kód másolása
 COPY . .
+RUN npm run build
 
-# Composer install (dev dependencies nélkül)
-RUN composer install \
-    --no-dev \
-    --optimize-autoloader \
-    --no-interaction \
-    --no-progress
+# -----------------------------------------------------------
+# PRODUCTION — Nginx kiszolgálja a statikus build-et
+# -----------------------------------------------------------
+FROM nginx:1.27-alpine AS production
 
-# Laravel cache-elés production-ban
-RUN php artisan config:cache && \
-    php artisan route:cache && \
-    php artisan view:cache
-
-# Fájljogosultságok
-RUN chown -R www-data:www-data /var/www/html/storage \
-    && chmod -R 775 /var/www/html/storage
-
-COPY docker/nginx.conf /etc/nginx/nginx.conf
-COPY docker/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+COPY --from=build /app/dist /usr/share/nginx/html
+COPY docker/nginx.conf /etc/nginx/conf.d/default.conf
 
 EXPOSE 80
 
-CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
+CMD ["nginx", "-g", "daemon off;"]
